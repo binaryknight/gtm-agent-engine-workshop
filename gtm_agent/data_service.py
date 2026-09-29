@@ -76,8 +76,16 @@ def update_prospect_info(prospect_id, technology):
     "Add a technology to a prospect's source-of-truth record."
     record = PROSPECTS.get(prospect_id)
     if record is None:
-        return {"updated": False, "found": False}
+        return {"updated": False, "found": False, "already_present": False, "tech_stack": []}
     tech_stack = list(record["tech_stack"])
-    if technology not in tech_stack:
+    already_present = technology in tech_stack
+    if not already_present:
         tech_stack.append(technology)
-    return {"updated": True, "found": True, "tech_stack": tech_stack}
+    record["tech_stack"] = tech_stack
+    _PROFILES.pop(prospect_id, None)
+    return {
+        "updated": True,
+        "found": True,
+        "already_present": already_present,
+        "tech_stack": tech_stack,
+    }
