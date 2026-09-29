@@ -11,9 +11,8 @@ import argparse
 import json
 import os
 import random
-import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
@@ -36,6 +35,9 @@ MAX_BACKDATE_DAYS = 0.95
 # rather than failing on the first empty read.
 WAIT_ATTEMPTS = 10
 WAIT_SECONDS = 3
+REUPLOAD_ATTEMPTS = 2
+RUN_ID_BATCH_SIZE = 100
+DEFAULT_MANIFEST = "upload_manifest.json"
 
 # The thumb a rep leaves on a reply. Reps rate what is in front of them: they
 # asked for something, and either it happened or it visibly did not. A send that
@@ -122,10 +124,149 @@ def bootstrap_project(client, name):
         return client.create_project(project_name=name).id
 
 
+def write_manifest(path, traces):
+    """Write expected regenerated run IDs and types for each trace."""
+    manifest = {
+        "traces": {
+            trace_id: {
+                "runs": [
+                    {"id": run["id"], "run_type": run["run_type"]}
+                    for run in trace_runs
+                ]
+            }
+            for trace_id, trace_runs in traces.items()
+        }
+    }
+    with open(path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def load_manifest(path):
+    """Load an upload manifest from disk."""
+    with open(path) as f:
+        manifest = json.load(f)
+    if not isinstance(manifest.get("traces"), dict):
+        raise ValueError(f"Manifest {path} must contain a traces object.")
+    return manifest
+
+
+def list_landed_runs(client, project_id, expected_ids):
+    """Return landed run IDs and types using bounded ID-filtered queries."""
+    landed = {}
+    expected_ids = list(expected_ids)
+    for start in range(0, len(expected_ids), RUN_ID_BATCH_SIZE):
+        for run in client.list_runs(
+            project_id=project_id,
+            run_ids=expected_ids[start : start + RUN_ID_BATCH_SIZE],
+            select=["id", "name", "start_time", "run_type", "trace_id"],
+        ):
+            landed[str(run.id)] = run.run_type
+    return landed
+
+
+def incomplete_traces(manifest, landed):
+    """Return per-trace ID and run-type differences from a landing check."""
+    incomplete = []
+    for trace_id, trace in manifest["traces"].items():
+        expected_runs = trace["runs"]
+        expected = {run["id"]: run["run_type"] for run in expected_runs}
+        landed_ids = set(expected) & set(landed)
+        expected_types = Counter(expected.values())
+        landed_types = Counter(landed[run_id] for run_id in landed_ids)
+        missing_types = {
+            run_type: count - landed_types[run_type]
+            for run_type, count in expected_types.items()
+            if count > landed_types[run_type]
+        }
+        unexpected_types = {
+            run_type: count - expected_types[run_type]
+            for run_type, count in landed_types.items()
+            if count > expected_types[run_type]
+        }
+        if len(landed_ids) != len(expected) or missing_types or unexpected_types:
+            incomplete.append(
+                {
+                    "trace_id": trace_id,
+                    "expected_ids": set(expected),
+                    "landed_ids": landed_ids,
+                    "missing_ids": set(expected) - landed_ids,
+                    "expected_count": len(expected),
+                    "landed_count": len(landed_ids),
+                    "missing_types": missing_types,
+                    "unexpected_types": unexpected_types,
+                }
+            )
+    return incomplete
+
+
+def verify_manifest(client, project_id, manifest):
+    """Wait for and report incomplete traces in an existing project."""
+    expected_ids = {
+        run["id"]
+        for trace in manifest["traces"].values()
+        for run in trace["runs"]
+    }
+    incomplete = []
+    for attempt in range(WAIT_ATTEMPTS):
+        landed = list_landed_runs(client, project_id, expected_ids)
+        incomplete = incomplete_traces(manifest, landed)
+        if not incomplete:
+            return []
+        if attempt + 1 < WAIT_ATTEMPTS:
+            time.sleep(WAIT_SECONDS)
+    return incomplete
+
+
+def format_incomplete_traces(incomplete):
+    """Format all incomplete trace details for an upload failure."""
+    return "; ".join(
+        f"{item['trace_id']}: {item['landed_count']}/{item['expected_count']} runs, "
+        f"missing types {item['missing_types'] or {}}"
+        for item in incomplete
+    )
+
+
+def create_run(client, run, project_name):
+    """Enqueue one run with the regenerated trace data."""
+    client.create_run(
+        id=run["id"],
+        trace_id=run["trace_id"],
+        dotted_order=run["dotted_order"],
+        parent_run_id=run["parent_run_id"],
+        name=run["name"],
+        run_type=run["run_type"],
+        inputs=run["inputs"],
+        outputs=run.get("outputs"),
+        error=run.get("error"),
+        extra=run.get("extra"),
+        tags=run.get("tags"),
+        start_time=run["start_time"],
+        end_time=run["end_time"],
+        project_name=project_name,
+    )
+
+
+def report_incomplete_traces(incomplete):
+    """Raise an upload error containing every incomplete trace."""
+    raise SystemExit(
+        "ERROR: incomplete traces after upload: "
+        + format_incomplete_traces(incomplete)
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", default=DEFAULT_PROJECT, help="Target project name")
     parser.add_argument("--input", default="traces.json", help="Input file path")
+    parser.add_argument(
+        "--manifest",
+        default=DEFAULT_MANIFEST,
+        help=f"Manifest path (default: {DEFAULT_MANIFEST})",
+    )
+    parser.add_argument(
+        "--verify-manifest",
+        help="Audit an existing project from a manifest without uploading",
+    )
     parser.add_argument(
         "--days",
         type=float,
@@ -148,6 +289,16 @@ def main():
 
     if not args.project:
         parser.error("No project name found. Set LANGSMITH_PROJECT in .env or pass --project.")
+
+    if args.verify_manifest:
+        client = Client()
+        project_id = client.read_project(project_name=args.project).id
+        manifest = load_manifest(args.verify_manifest)
+        incomplete = verify_manifest(client, project_id, manifest)
+        if incomplete:
+            report_incomplete_traces(incomplete)
+        print(f"Verified {len(manifest['traces'])} traces from {args.verify_manifest}.")
+        return
 
     with open(args.input) as f:
         runs = json.load(f)
@@ -226,6 +377,7 @@ def main():
         f"Spread {len(traces)} traces over {args.days} days: "
         f"{min(all_starts):%Y-%m-%d %H:%M} to {max(all_starts):%Y-%m-%d %H:%M}"
     )
+    write_manifest(args.manifest, traces)
 
     client = Client()
     project_id = bootstrap_project(client, args.project)
@@ -256,22 +408,7 @@ def main():
             build_dotted_order(run)
 
         for run in trace_runs:
-            client.create_run(
-                id=run["id"],
-                trace_id=run["trace_id"],
-                dotted_order=run["dotted_order"],
-                parent_run_id=run["parent_run_id"],
-                name=run["name"],
-                run_type=run["run_type"],
-                inputs=run["inputs"],
-                outputs=run.get("outputs"),
-                error=run.get("error"),
-                extra=run.get("extra"),
-                tags=run.get("tags"),
-                start_time=run["start_time"],
-                end_time=run["end_time"],
-                project_name=args.project,
-            )
+            create_run(client, run, args.project)
 
         if (i + 1) % 10 == 0:
             print(f"  Uploaded {i + 1}/{len(traces)} traces")
@@ -280,43 +417,27 @@ def main():
     print("Flushing...")
     client.flush()
 
-    # create_run() only enqueues; the HTTP POST happens on a background thread and
-    # a rejected batch is logged there, not raised here. Count what actually landed
-    # before claiming success, so a server-side rejection cannot pass for an upload.
-    # Filter by the ids just uploaded instead of listing the project and intersecting
-    # locally: the project holds every previous upload too, and paging all of it back
-    # costs ~15x this query and grows every run. The ids go in the POST body, so the
-    # whole batch fits one call, and the filter makes the intersection implicit.
-    expected_ids = {run["id"] for trace_runs in traces.values() for run in trace_runs}
-    landed_ids = set()
-    for attempt in range(WAIT_ATTEMPTS):
-        landed_ids = {
-            str(r.id)
-            for r in client.list_runs(
-                # Filter by project_id, not project_name: the name -> id index lags
-                # create_project by several seconds, so passing project_name would
-                # 404 on read_project inside list_runs even though the project
-                # already exists. project_id skips that resolve.
-                project_id=project_id,
-                run_ids=list(expected_ids),
-                # The check needs ids, not the inputs/outputs hanging off them. These
-                # are the fields the Run model requires; trimming further fails to parse.
-                select=["id", "name", "start_time", "run_type", "trace_id"],
-            )
-        }
-        if len(landed_ids) == len(expected_ids):
+    manifest = load_manifest(args.manifest)
+    incomplete = verify_manifest(client, project_id, manifest)
+    run_by_id = {
+        run["id"]: run for trace_runs in traces.values() for run in trace_runs
+    }
+    for _ in range(REUPLOAD_ATTEMPTS):
+        if not incomplete:
             break
-        time.sleep(WAIT_SECONDS)
-
-    missing = len(expected_ids) - len(landed_ids)
-    if missing:
-        print(
-            f"ERROR: only {len(landed_ids)}/{len(expected_ids)} runs landed in "
-            f"'{args.project}' ({missing} missing). Check the ingest warnings above.",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
-    print(f"Verified {len(landed_ids)}/{len(expected_ids)} runs landed.")
+        missing_ids = {
+            run_id for item in incomplete for run_id in item["missing_ids"]
+        }
+        if not missing_ids:
+            break
+        for run_id in missing_ids:
+            create_run(client, run_by_id[run_id], args.project)
+        client.flush()
+        incomplete = verify_manifest(client, project_id, manifest)
+    if incomplete:
+        report_incomplete_traces(incomplete)
+    expected_count = sum(len(trace["runs"]) for trace in manifest["traces"].values())
+    print(f"Verified {expected_count}/{expected_count} runs landed.")
 
     # Every trace carries the rating its rep left on the reply. Traces captured
     # before ratings were collected have none, so derive the one that rep would
